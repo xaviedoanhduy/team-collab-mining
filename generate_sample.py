@@ -1,9 +1,10 @@
-"""Generate a synthetic dataset (users, tickets, working hours) for the analysis.
+"""Generate a synthetic dataset (employees, tasks, timesheets) in the Odoo 17+ schema the analysis reads.
 
 Ticket workflow:
-- 1 main developer (sometimes 2) codes against `development_time`.
+- 1 main developer (sometimes 2) codes against the dev estimate.
 - The project's TPM reviews the code (most tickets; skipped on some).
-- A QC tests against `qc_estimate` = 20% of the dev estimate.
+- A QC tests against a QC estimate = 20% of the dev estimate.
+  `allocated_hours` = dev + QC estimate.
 So a typical ticket has 3 people (dev, TPM, QC), or 2 without review.
 
 Planted ground truth (so the analysis can be checked):
@@ -84,7 +85,7 @@ TRIO_EFFECTS = {  # dev + TPM + QC; applies to everyone's hours and reopen
 STICKY_PAIRS = [("long.mai", "ngoc.ha"), ("quan.lam", "phuc.cao")]
 
 ACTIVITIES = ["Feature", "Bug", "Improvement", "Support", "Migration"]
-STATES_OPEN = ["assigned", "wip", "code_completed", "in_qa"]
+STATES_OPEN = ["01_in_progress", "02_changes_requested", "03_approved", "04_waiting_normal"]
 SUMMARIES = {
     "Feature": ["Add {x} to {y}", "New report for {y}", "Allow {x} on {y}"],
     "Bug": ["Fix {x} error on {y}", "Wrong {x} computed in {y}", "Crash when saving {y}"],
@@ -125,7 +126,7 @@ def generate(seed=42):
     tickets, entries = [], []
     ticket_id, entry_id = 30001, 900001
 
-    for proj_name, code, pm, tpm, devs, qcs, consultants, n_tickets, review_rate in PROJECTS:
+    for project_id, (proj_name, code, pm, tpm, devs, qcs, consultants, n_tickets, review_rate) in enumerate(PROJECTS, 1):
         span = (END - START).days
         for _ in range(n_tickets):
             activity = rng.choices(ACTIVITIES, weights=[40, 25, 15, 12, 8])[0]
@@ -170,7 +171,7 @@ def generate(seed=42):
             created = START + timedelta(days=rng.randrange(span - 30))
             work_days = workdays_from(rng, created, max(1, int(dev_hours / 3) + rng.randint(0, 3)))
             open_ticket = created > END - timedelta(days=60) and rng.random() < 0.6 or rng.random() < 0.05
-            state = rng.choice(STATES_OPEN) if open_ticket else "closed"
+            state = rng.choice(STATES_OPEN) if open_ticket else "1_done"
 
             summary = rng.choice(SUMMARIES[activity]).format(x=rng.choice(WORDS_X), y=rng.choice(WORDS_Y))
             desc = f"#{ticket_id}: [{code}] {summary}"
@@ -180,8 +181,8 @@ def generate(seed=42):
                 if hours <= 0:
                     return
                 entries.append({
-                    "id": entry_id, "ticket_id": ticket_id, "project": proj_name,
-                    "user_id": USER_ID[user], "date": day.isoformat(), "duration_hour": round(hours * 4) / 4 or 0.25,
+                    "id": entry_id, "task_id": ticket_id, "project_id": project_id,
+                    "employee_id": USER_ID[user], "date": day.isoformat(), "unit_amount": round(hours * 4) / 4 or 0.25,
                     "dev_type": dev_type, "name": desc,
                 })
                 entry_id += 1
@@ -217,27 +218,14 @@ def generate(seed=42):
 
             last_day = qc_day + timedelta(days=rng.randint(1, 5) + 2 * reopening_times)
             tickets.append({
-                "id": ticket_id, "name": summary, "project": proj_name, "activity": activity,
-                "state": state, "priority": rng.choices(["low", "normal", "high", "very_high"], weights=[15, 60, 20, 5])[0],
-                "owner_id": USER_ID[pm], "developer_id": USER_ID[dev_team[0]],
-                "development_time": estimate, "qc_estimate": qc_estimate, "reopening_times": reopening_times,
+                "id": ticket_id, "name": summary, "project_id": project_id, "state": state,
+                "priority": rng.choices(["0", "1"], weights=[80, 20])[0],  # Odoo: 1 = starred
+                "allocated_hours": estimate + qc_estimate, "reopen_count": reopening_times,
                 "create_date": datetime.combine(created, datetime.min.time()).replace(hour=rng.randint(8, 17)).isoformat(sep=" "),
-                "closing_datetime": "" if open_ticket else datetime.combine(last_day, datetime.min.time()).replace(hour=rng.randint(9, 18)).isoformat(sep=" "),
+                "date_end": "" if open_ticket else datetime.combine(last_day, datetime.min.time()).replace(hour=rng.randint(9, 18)).isoformat(sep=" "),
             })
             ticket_id += 1
 
-    # Totals are derived from the entries.
-    totals = {}
-    for e in entries:
-        t = totals.setdefault(e["ticket_id"], {"all": 0.0, "fixing": 0.0, "qa": 0.0})
-        t["all"] += e["duration_hour"]
-        if e["dev_type"] in ("fixing", "qa"):
-            t[e["dev_type"]] += e["duration_hour"]
-    for t in tickets:
-        tot = totals.get(t["id"], {"all": 0.0, "fixing": 0.0, "qa": 0.0})
-        t["time_spent"] = round(tot["all"], 2)
-        t["fixing_time_spent"] = round(tot["fixing"], 2)
-        t["sum_qc_time"] = round(tot["qa"], 2)
     return tickets, entries
 
 
@@ -256,16 +244,14 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
 
     tickets, entries = generate(args.seed)
-    # Free-text `name` (ticket title, "#N: [code] ...") is generated for realism but not
+    # Free-text `name` (task title, timesheet description) is generated for realism but not
     # exported: the analysis doesn't need it and it is the easiest field to leak client details through.
-    write_csv(args.out / "users.csv", [dict(zip(["user_id", "login", "name", "role"], (USER_ID[u[0]], *u[:3])))
-                                       for u in USERS], ["user_id", "login", "name", "role"])
-    write_csv(args.out / "tickets.csv", tickets,
-              ["id", "project", "activity", "state", "priority", "owner_id", "developer_id",
-               "development_time", "qc_estimate", "time_spent", "sum_qc_time", "fixing_time_spent",
-               "reopening_times", "create_date", "closing_datetime"])
-    write_csv(args.out / "work_entries.csv", entries,
-              ["id", "ticket_id", "project", "user_id", "date", "duration_hour", "dev_type"])
+    write_csv(args.out / "hr_employee.csv", [{"id": USER_ID[u[0]], "name": u[1], "role": u[2]} for u in USERS],
+              ["id", "name", "role"])
+    write_csv(args.out / "project_task.csv", tickets,
+              ["id", "project_id", "state", "priority", "allocated_hours", "reopen_count", "create_date", "date_end"])
+    write_csv(args.out / "account_analytic_line.csv", entries,
+              ["id", "task_id", "project_id", "employee_id", "date", "unit_amount"])
     print(f"{len(tickets)} tickets, {len(entries)} work entries -> {args.out}")
 
 

@@ -113,7 +113,7 @@ def pct(v):
 
 
 def member_list(labels):
-    """'Name (login) - Role' labels -> one list item per person with a role tag."""
+    """'Name - Role' labels -> one list item per person with a role tag."""
     items = []
     for lab in labels:
         name, _, role = lab.rpartition(" - ")
@@ -153,11 +153,12 @@ def network_svg(pairs, users, label, team, ticket_by_id, min_edge, min_shared):
     # Group nodes on a circle by each user's main project, so project teams sit together.
     main_proj = {}
     for u in {u for m in team.values() for u in m}:
-        c = Counter(ticket_by_id[t]["project"] for t, m in team.items() if u in m)
-        main_proj[u] = c.most_common(1)[0][0]
+        c = Counter(ticket_by_id[t]["project_id"] for t, m in team.items() if u in m)
+        p = c.most_common(1)[0][0]
+        main_proj[u] = f"Project {p}" if p.isdigit() else p
     order = sorted(main_proj, key=lambda u: (main_proj[u], u))
     r = 210
-    cx = cy = r + 300  # room for radial labels like "Nguyen Van An (an.nguyen) - Developer"
+    cx = cy = r + 300  # room for radial labels like "Nguyen Van An - Developer"
     size = 2 * cx
     gap = 0.35  # radians between project groups
     projects = list(dict.fromkeys(main_proj[u] for u in order))
@@ -229,7 +230,7 @@ def network_svg(pairs, users, label, team, ticket_by_id, min_edge, min_shared):
 
 def render(groups, users, ctx, args):
     team, ticket_by_id, label = ctx["team"], ctx["ticket_by_id"], ctx["label"]
-    user_map = {u["user_id"]: u for u in users} if args.show_individuals else {}
+    user_map = {u["employee_id"]: u for u in users} if args.show_individuals else {}
     rated = [g for g in groups if g["scored_tickets"] >= args.min_shared]
     pairs = []
     for g in groups:
@@ -323,16 +324,16 @@ at least {args.min_hours}h logged on a ticket to count as a member</p>
       <code>n<sub>A</sub> * n<sub>B</sub> / n<sub>project</sub></code> (trio: <code>n<sub>A</sub>n<sub>B</sub>n<sub>C</sub> / n<sub>project</sub><sup>2</sup></code>),
       i.e. how often they would meet if staffed at random. &gt; 1 = together more than chance. With only 2 or 3 people per
       ticket it stays near 1, so Jaccard is used for ranking.</dd>
-    <dt>Closed &amp; estimated</dt><dd>Shared tickets that are closed and have a dev estimate. Only these count for hours and
+    <dt>Closed &amp; estimated</dt><dd>Shared tickets that are done and have allocated hours. Only these count for hours and
       reopens; groups need {args.min_shared}+ to be rated.</dd>
-    <dt>Hours vs apart</dt><dd>Per ticket: <code>ln(team hours / (dev estimate + QC estimate))</code>, minus the average of
+    <dt>Hours vs apart</dt><dd>Per ticket: <code>ln(team hours / allocated hours)</code>, minus the average of
       tickets in the same project and team size. Group value = average on shared tickets minus each member's average on
       tickets <i>without</i> the others, shown as %. -15% means about 15% fewer hours together than apart.</dd>
-    <dt>Reopens vs apart</dt><dd>Same, using <code>reopening_times</code>. -0.20 = 0.2 fewer reopens per ticket together.</dd>
+    <dt>Reopens vs apart</dt><dd>Same, using <code>reopen_count</code>. -0.20 = 0.2 fewer reopens per ticket together.</dd>
     <dt>95% interval</dt><dd>Range the true value likely falls in, from the spread of the tickets behind it
       (shown as a whisker on each bar). If it crosses 0 the bar is <b>gray</b>: the difference could be noise.
       With {len(rated)} groups rated, about {round(len(rated) * 0.05)} will still look clear by chance.</dd>
-    <dt>Avg reopen</dt><dd>Plain average of <code>reopening_times</code> on the group's scored tickets
+    <dt>Avg reopen</dt><dd>Plain average of <code>reopen_count</code> on the group's scored tickets
       (overall: {ctx['reopen_avg']:.2f}).</dd>
     <dt>Shrinkage</dt><dd>Averages are <code>sum / (n + {args.shrink:g})</code> instead of <code>sum / n</code>, so a group with
       few tickets is pulled toward 0 and can't top a list by luck.</dd>

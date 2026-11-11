@@ -3,11 +3,11 @@
 Find out, from per-ticket working hours:
 
 - **who works together** most often, and
-- **which pairs and trios finish tickets faster** (or slower, or with more reopens) than the same
+- **which pairs and trios finish tasks faster** (or slower, or with more reopens) than the same
   people do apart.
 
-Python 3.10+, standard library only, nothing to install. Ships with a synthetic dataset so you can
-try it in one minute.
+Python 3.10+, standard library only, nothing to install. Reads the Odoo 17+ project and timesheet
+schema, and ships with a synthetic dataset so you can try it in one minute.
 
 ![Report: metric glossary and collaboration network](docs/report.png)
 
@@ -30,52 +30,76 @@ python3 -m unittest -v          # check the analysis still finds the effects pla
 
 ## Use your own data
 
-Put three CSV files in a folder and run `python3 analyze.py --data path/to/folder`.
+The input follows the standard Odoo 17+ models of the `project` and `hr_timesheet` modules, one CSV
+per model. Other tools work too, as long as you produce the same columns.
+
+### The CSV files
+
 Only the **bold** columns are required; extra columns are ignored.
 
-**users.csv** (one row per person)
+**hr_employee.csv**
 
 | column | meaning |
 |---|---|
-| **user_id** | numeric id (see [User ids](#user-ids) if you don't have one) |
+| **id** | employee id |
 | **role** | `dev`, `tpm`, `qa`, `pm` or `consultant` (`qa` is shown as QC) |
-| login, name | only used for labels in the report: `Name (login) - Role` |
+| name | label in the report: `Name - Role` (`#id - Role` when empty) |
 
-**tickets.csv** (one row per ticket)
-
-| column | meaning |
-|---|---|
-| **id** | ticket id |
-| **project** | tickets are only compared within the same project |
-| **state** | only `closed` tickets count for hours and reopens |
-| **development_time** | dev estimate in hours; `0` or empty = not estimated (skipped) |
-| **reopening_times** | how many times the ticket was reopened |
-| qc_estimate | QC estimate in hours, added to the dev estimate |
-
-**work_entries.csv** (one row per time entry)
+**project_task.csv**
 
 | column | meaning |
 |---|---|
-| **ticket_id** or **task_id** | ticket the time was logged on; empty = skipped |
-| **user_id** | who logged it |
-| **duration_hour** | hours |
+| **id** | task id |
+| **project_id** | tasks are only compared within the same project |
+| **state** | only `1_done` tasks count for hours and reopens |
+| **allocated_hours** | estimate; `0` or empty = not estimated (skipped) |
+| reopen_count | times the task was reopened; empty = 0 |
 
-Do not export free-text fields (ticket titles, entry descriptions): the analysis doesn't need them
-and they are the easiest way to leak client details.
+**account_analytic_line.csv** (timesheets)
 
-### User ids
-
-If `users.csv` has no `user_id`, one is derived from `HMAC-SHA256(salt, name|login)`. The salt is
-a secret you keep outside the repo and outside the exported files:
-
-```bash
-export TEAM_MINING_SALT="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"  # once, store it safely
-```
-
-The same salt always gives the same id, and without it nobody can map ids back to people.
-Without `user_id` and without the salt, the run stops with an error.
+| column | meaning |
+|---|---|
+| **task_id** | task the time was logged on; empty = skipped |
+| **employee_id** | who logged it |
+| **unit_amount** | hours |
 
 ## Reading the results
+
+### One result, explained
+
+```
+                     (8 tickets / 237 tickets), 8 closed & estimated, 95% CI -23.7% to -5.3%
+ -15.0%  ████████    - Pham Quoc Dung - Developer
+                     - Ly Khanh Linh - Developer
+```
+
+- **8 tickets / 237 tickets**: both of them worked on 8 tickets; 237 multi-person tickets have at
+  least one of them. 8 / 237 is their Jaccard (how often they are together).
+- **8 closed & estimated**: those 8 are done and have allocated hours, so they can be scored.
+- **-15.0%**: on those tickets they needed about 15% fewer hours than each of them needs on
+  similar tickets without the other. Negative = faster together.
+- **95% CI -23.7% to -5.3%**: 8 tickets is not much, so -15% is not exact. The true value is most
+  likely somewhere in this range.
+
+### The 95% interval (CI)
+
+The interval says how sure the number is. What matters is whether it crosses 0 (no difference):
+
+```
+                              faster together 0 slower together
+                                              |
+ A  -15%  CI -24% to -5%          [===*=====] |   clear: faster
+ B  +19%  CI +8% to +31%                      |   [=====*=====]   clear: slower
+ C   -9%  CI -22% to +4%           [======*===|=]   crosses 0: could be noise
+```
+
+Left of 0 = negative = fewer hours. More tickets give a narrower interval. A wide
+interval that crosses 0 does not mean "no effect"; it means "not enough data to tell".
+
+95% also means about 1 result in 20 looks clear by pure chance: with 145 groups rated, expect
+around 7 such false alarms. A single clear result on 5 tickets is a hint, not a fact.
+
+### All metrics
 
 | metric | meaning |
 |---|---|
@@ -83,11 +107,11 @@ Without `user_id` and without the salt, the run stops with an error.
 | Jaccard | shared tickets / tickets with any of them. 0 = never together, 1 = always together. Compare within one role mix only: a TPM reviews most of a project, so Developer + TPM is naturally high. |
 | hours vs apart | e.g. `-15%`: the group needs about 15% fewer hours together than its members need apart, on comparable tickets |
 | reopens vs apart | e.g. `-0.16`: 0.16 fewer reopens per ticket together than apart |
-| 95% CI | range the true value likely falls in. If it crosses 0 the result is marked **could be noise** (gray in the report). |
+| 95% CI | see above. Crosses 0 = marked **could be noise** (gray in the report). |
 | closed & estimated | shared tickets used for hours and reopens; a group needs `--min-shared` (5) of them to be rated |
 
-A colored (clear) result means the difference is stable, not that the pair causes it: who gets
-staffed on which tickets matters too. Treat results as hints to look into, not verdicts.
+A clear result means the difference is stable, not that the pair causes it: who gets staffed on
+which tickets matters too. Treat results as hints to look into, not verdicts.
 
 ### Outputs in `reports/`
 
@@ -95,7 +119,7 @@ staffed on which tickets matters too. Treat results as hints to look into, not v
 |---|---|
 | `report.html` | single page, no dependencies, light and dark: glossary, network, best/worst trios and pairs, reopens, most-together, full table |
 | `groups.csv` | one row per pair or trio with every metric above, including `*_ci_low`, `*_ci_high`, `*_significant` |
-| `huim_spmf.txt`, `huim_items.csv` | the same tickets in SPMF format (`items:TU:utilities`) for high-utility itemset mining tools |
+| `huim_spmf.txt`, `huim_items.csv` | the same tasks in SPMF format (`items:TU:utilities`) for high-utility itemset mining tools |
 | `users.csv` | only with `--show-individuals` |
 
 ## Options
@@ -117,10 +141,10 @@ staffed on which tickets matters too. Treat results as hints to look into, not v
 1. **Team of a ticket**: users of the chosen roles who logged at least `--min-hours` on it.
    A typical ticket: 1 or 2 developers, the project's TPM (code review) and a QC.
 2. **Groups**: every pair and trio inside a team.
-3. **Hours per ticket**: `ln(team hours / (dev estimate + QC estimate))`, minus the average of
+3. **Hours per ticket**: `ln(team hours / allocated_hours)`, minus the average of
    tickets in the same project with the same team size. This residual is negative when the
    ticket went faster than comparable work.
-4. **Reopens per ticket**: `reopening_times`, residual computed the same way.
+4. **Reopens per ticket**: `reopen_count`, residual computed the same way.
 5. **Together vs apart**: the group's average residual on shared tickets, minus each member's
    average on tickets **without the other members**. Using all of a member's tickets would mix
    the group's own effect into its baseline. Averages are `sum / (n + shrink)`.

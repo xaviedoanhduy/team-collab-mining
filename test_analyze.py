@@ -8,6 +8,13 @@ import report
 import generate_sample as gen
 
 
+def sample():
+    tickets, entries = gen.generate(seed=42)
+    employees = [{"id": str(gen.USER_ID[u[0]]), "name": u[1], "role": u[2]} for u in gen.USERS]
+    str_rows = [[{k: str(v) for k, v in r.items()} for r in rows] for rows in (tickets, entries)]
+    return employees, *str_rows
+
+
 def ids(members):
     """'a.login + b.login' -> {user_id, ...}"""
     return {str(gen.USER_ID[m]) for m in members.split(" + ")}
@@ -25,10 +32,7 @@ class TestPlantedTruth(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        tickets, entries = gen.generate(seed=42)
-        users = [{"user_id": str(gen.USER_ID[u[0]]), "login": u[0], "name": u[1], "role": u[2]} for u in gen.USERS]
-        str_t = [{k: str(v) for k, v in t.items()} for t in tickets]
-        cls.groups, _, _ = analyze.analyze(users, str_t, entries)
+        cls.groups, _, _ = analyze.analyze(*sample())
         rated = [r for r in cls.groups if r["scored_tickets"] >= 5]
         cls.pairs = sorted((r for r in rated if r["size"] == 2), key=lambda r: r["hours_vs_expected_pct"])
         cls.trios = sorted((r for r in rated if r["size"] == 3), key=lambda r: r["hours_vs_expected_pct"])
@@ -61,9 +65,7 @@ class TestPlantedTruth(unittest.TestCase):
         self.assertFalse([r["members"] for r in zero if r["reopen_significant"]])
 
     def test_individuals_hidden_by_default(self):
-        tickets, entries = gen.generate(seed=42)
-        users = [{"user_id": str(gen.USER_ID[u[0]]), "login": u[0], "name": u[1], "role": u[2]} for u in gen.USERS]
-        groups, users_out, ctx = analyze.analyze(users, [{k: str(v) for k, v in t.items()} for t in tickets], entries)
+        groups, users_out, ctx = analyze.analyze(*sample())
         args = argparse.Namespace(data="x", roles="dev,tpm,qa", min_hours=0.5, min_shared=5, shrink=5.0, top=8,
                                   min_edge=3, show_individuals=False)
         html = report.render(groups, users_out, ctx, args)
@@ -82,35 +84,22 @@ class TestPlantedTruth(unittest.TestCase):
 
 
 class TestSmall(unittest.TestCase):
-    def test_user_id_hmac(self):
-        u = {"login": "a", "name": "A A", "role": "dev"}
-        self.assertEqual(analyze.user_id_of(u, "s1"), analyze.user_id_of(dict(u), "s1"))
-        self.assertNotEqual(analyze.user_id_of(u, "s1"), analyze.user_id_of(u, "s2"))
-        self.assertNotEqual(analyze.user_id_of(u, "s1"), analyze.user_id_of(dict(u, name="B B"), "s1"))
-        self.assertEqual(analyze.user_id_of(dict(u, user_id="7")), 7)  # given id wins, no salt needed
-        with self.assertRaises(ValueError):
-            analyze.user_id_of(u)  # no id and no salt
-
     def test_roles_min_hours_and_labels(self):
-        # users without user_id (HMAC), entries keyed by task_id / ticket_id
-        users = [{"login": "a", "name": "A A", "role": "dev"}, {"login": "q", "name": "Q Q", "role": "qa"},
-                 {"login": "p", "name": "P P", "role": "pm"}]
-        tickets = [{"id": "1", "project": "X", "state": "closed", "development_time": "10", "qc_estimate": "2",
-                    "reopening_times": "0"},
-                   {"id": "2", "project": "X", "state": "closed", "development_time": "10", "qc_estimate": "2",
-                    "reopening_times": "1"}]
-        a, q, p = (analyze.user_id_of(u, "salt") for u in users)
-        entries = [{"task_id": "1", "user_id": str(a), "duration_hour": "4"},
-                   {"ticket_id": "1", "user_id": str(q), "duration_hour": "1"},
-                   {"task_id": "1", "user_id": str(p), "duration_hour": "9"},     # pm not in roles
-                   {"task_id": "2", "user_id": str(a), "duration_hour": "0.25"},  # below min_hours
-                   {"task_id": "", "user_id": str(a), "duration_hour": "8"}]      # not linked to a ticket
-        groups, users_out, _ = analyze.analyze(users, tickets, entries, salt="salt")
+        employees = [{"id": "1", "name": "A A", "role": "dev"}, {"id": "2", "name": "", "role": "qa"},
+                     {"id": "3", "name": "P P", "role": "pm"}]
+        tasks = [{"id": "10", "project_id": "7", "state": "1_done", "allocated_hours": "12", "reopen_count": "0"},
+                 {"id": "11", "project_id": "7", "state": "1_done", "allocated_hours": "12"}]  # no reopen_count
+        lines = [{"task_id": "10", "employee_id": "1", "unit_amount": "4"},
+                 {"task_id": "10", "employee_id": "2", "unit_amount": "1"},
+                 {"task_id": "10", "employee_id": "3", "unit_amount": "9"},     # pm not in roles
+                 {"task_id": "11", "employee_id": "1", "unit_amount": "0.25"},  # below min_hours
+                 {"task_id": "", "employee_id": "1", "unit_amount": "8"}]       # timesheet without task
+        groups, users_out, _ = analyze.analyze(employees, tasks, lines)
         self.assertEqual([(r["members"], r["role_mix"], r["shared_tickets"], r["jaccard"]) for r in groups],
-                         [(f"{a} + {q}", "Developer + QC", 1, 1.0)])
-        self.assertEqual(groups[0]["member_labels"], "A A (a) - Developer + Q Q (q) - QC")
+                         [("1 + 2", "Developer + QC", 1, 1.0)])
+        self.assertEqual(groups[0]["member_labels"], "A A - Developer + #2 - QC")
         self.assertEqual(groups[0]["synergy"], 0.0)  # one ticket, one bucket: residual 0
-        self.assertEqual({r["user_id"] for r in users_out}, {a, q})
+        self.assertEqual({r["employee_id"] for r in users_out}, {1, 2})
 
 
 if __name__ == "__main__":

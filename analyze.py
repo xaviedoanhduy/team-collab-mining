@@ -1,6 +1,7 @@
 """Find who works together and which teams (pairs, trios) deliver tickets more efficiently.
 
-Input (CSVs, see README): users.csv, tickets.csv, work_entries.csv.
+Input (CSVs named after the Odoo 17+ models, see README; odoo_extract.py writes them):
+hr_employee.csv, project_task.csv, account_analytic_line.csv.
 Output: reports/groups.csv, report.html, an SPMF-format HUIM dataset (and users.csv with --show-individuals).
 
 Method:
@@ -10,10 +11,10 @@ Method:
 - Co-work strength = Jaccard over multi-person tickets (tickets with all members /
   tickets with any member). Compare within one role mix: a project's TPM sits on
   most of its tickets, so "dev + TPM" is naturally higher than "dev + dev".
-- Efficiency = ln(team hours / (dev estimate + QC estimate)) on closed, estimated
+- Efficiency = ln(team hours / allocated_hours) on done, estimated
   tickets, minus the mean of tickets in the same project and team size (the
   residual). Negative = faster than comparable tickets.
-- Quality = reopening_times, residual the same way. Fewer hours with more
+- Quality = reopen_count, residual the same way. Fewer hours with more
   reopens is not efficient, so both are reported.
 - Group synergy = group residual - average of its members' residual on tickets
   where they work WITHOUT the other members, i.e. "are they better together than apart". Means are shrunk toward 0
@@ -24,10 +25,7 @@ Method:
 
 import argparse
 import csv
-import hashlib
-import hmac
 import math
-import os
 from collections import defaultdict
 from itertools import combinations
 from pathlib import Path
@@ -38,35 +36,18 @@ import report
 ROLE_LABELS = {"pm": "PM", "tpm": "TPM", "dev": "Developer", "qa": "QC", "consultant": "Consultant"}
 ROLE_ORDER = {"dev": 0, "tpm": 1, "qa": 2}
 Z95 = 1.96
-TICKET_KEYS = ("ticket_id", "task_id")  # first non-empty wins
+DONE = "1_done"  # project.task state in Odoo 17+
 
 
-SALT_ENV = "TEAM_MINING_SALT"
+def user_label(emp):
+    """'Nguyen Van An - Developer', or '#42 - Developer' when names were left out."""
+    role = ROLE_LABELS.get(emp["role"], emp["role"].title())
+    return f"{emp.get('name') or '#' + emp['id']} - {role}"
 
 
-def user_label(user, uid):
-    """'Nguyen Van An (an.nguyen) - PM'"""
-    role = ROLE_LABELS.get(user["role"], user["role"].title())
-    login = user.get("login") or f"#{uid}"
-    return f"{user.get('name') or login} ({login}) - {role}"
-
-
-def user_id_of(user, salt=None):
-    """`user_id` from the file, else HMAC-SHA256(salt, name|login) cut to 48 bits.
-
-    Same salt -> same id across exports; without the salt the id can't be recomputed from a user list.
-    """
-    if user.get("user_id"):
-        return int(user["user_id"])
-    if not salt:
-        raise ValueError(f"user {user.get('login')!r} has no user_id: set {SALT_ENV} (a secret) to derive one")
-    digest = hmac.new(salt.encode(), f"{user.get('name', '')}|{user['login']}".encode(), hashlib.sha256)
-    return int(digest.hexdigest()[:12], 16)
-
-
-def ticket_of(entry):
-    """Ticket id of a work entry (`ticket_id` or `task_id`), None if unlinked."""
-    return next((int(entry[k]) for k in TICKET_KEYS if entry.get(k)), None)
+def reopen_count(task):
+    """Optional column: 0 when the export could not read stage history."""
+    return int(task.get("reopen_count") or 0)
 
 
 def read_csv(path):
@@ -76,24 +57,22 @@ def read_csv(path):
 
 def load(data_dir):
     data_dir = Path(data_dir)
-    return (read_csv(data_dir / "users.csv"), read_csv(data_dir / "tickets.csv"),
-            read_csv(data_dir / "work_entries.csv"))
+    return (read_csv(data_dir / "hr_employee.csv"), read_csv(data_dir / "project_task.csv"),
+            read_csv(data_dir / "account_analytic_line.csv"))
 
 
-def analyze(users, tickets, entries, roles=("dev", "tpm", "qa"), min_hours=0.5, shrink=5.0, max_size=3, salt=None):
-    ids = [user_id_of(u, salt) for u in users]
-    if len(set(ids)) != len(ids):
-        raise ValueError("duplicate user_id in users")
-    role_of = {i: u["role"] for i, u in zip(ids, users)}
-    label = {i: user_label(u, i) for i, u in zip(ids, users)}
+def analyze(employees, tickets, entries, roles=("dev", "tpm", "qa"), min_hours=0.5, shrink=5.0, max_size=3):
+    role_of = {int(e["id"]): e["role"] for e in employees}
+    if len(role_of) != len(employees):
+        raise ValueError("duplicate id in employees")
+    label = {int(e["id"]): user_label(e) for e in employees}
     ticket_by_id = {int(t["id"]): t for t in tickets}
 
-    hours = defaultdict(lambda: defaultdict(float))  # ticket -> user id -> hours
+    hours = defaultdict(lambda: defaultdict(float))  # task -> employee id -> hours
     for e in entries:
-        uid = int(e["user_id"])
-        tid = ticket_of(e)
-        if tid is not None and role_of.get(uid) in roles:
-            hours[tid][uid] += float(e["duration_hour"])
+        uid = int(e["employee_id"])
+        if e["task_id"] and role_of.get(uid) in roles:  # timesheets on a project without task are skipped
+            hours[int(e["task_id"])][uid] += float(e["unit_amount"])
     team = {tid: {u: h for u, h in uh.items() if h >= min_hours} for tid, uh in hours.items()}
     team = {tid: t for tid, t in team.items() if t and tid in ticket_by_id}
 
@@ -112,7 +91,7 @@ def analyze(users, tickets, entries, roles=("dev", "tpm", "qa"), min_hours=0.5, 
     for tid, members in team.items():
         if len(members) < 2:  # solo tickets say nothing about who one works with
             continue
-        p = ticket_by_id[tid]["project"]
+        p = ticket_by_id[tid]["project_id"]
         n_proj[p] += 1
         for u in members:
             n_user[p][u] += 1
@@ -124,12 +103,12 @@ def analyze(users, tickets, entries, roles=("dev", "tpm", "qa"), min_hours=0.5, 
     overrun = {}
     for tid, members in team.items():
         t = ticket_by_id[tid]
-        est = float(t["development_time"] or 0) + float(t.get("qc_estimate") or 0)
-        if t["state"] == "closed" and est > 0:
+        est = float(t["allocated_hours"] or 0)
+        if t["state"] == DONE and est > 0:
             overrun[tid] = math.log(sum(members.values()) / est)
 
     def bucket(tid):
-        return ticket_by_id[tid]["project"], min(len(team[tid]), 4)
+        return ticket_by_id[tid]["project_id"], min(len(team[tid]), 4)
 
     buckets = defaultdict(list)
     for tid, o in overrun.items():
@@ -138,7 +117,7 @@ def analyze(users, tickets, entries, roles=("dev", "tpm", "qa"), min_hours=0.5, 
     resid = {tid: o - bucket_mean[bucket(tid)] for tid, o in overrun.items()}
 
     # Quality: reopens vs comparable tickets. Fewer hours only counts as "efficient" if quality holds.
-    reopens = {tid: int(ticket_by_id[tid]["reopening_times"]) for tid in resid}
+    reopens = {tid: reopen_count(ticket_by_id[tid]) for tid in resid}
     rq = defaultdict(list)
     for tid in resid:
         rq[bucket(tid)].append(reopens[tid])
@@ -177,12 +156,12 @@ def analyze(users, tickets, entries, roles=("dev", "tpm", "qa"), min_hours=0.5, 
         return est, est - Z95 * se, est + Z95 * se
 
     def reopen(tids):
-        return round(sum(int(ticket_by_id[t]["reopening_times"]) for t in tids) / len(tids), 2) if tids else ""
+        return round(sum(reopen_count(ticket_by_id[t]) for t in tids) / len(tids), 2) if tids else ""
 
     user_eff = {u: shrunk(t) for u, t in user_r.items()}
     user_q = {u: shrunk(t, q_resid) for u, t in user_r.items()}
     user_rows = sorted(({
-        "user_id": u, "label": label[u], "role": role_of[u],
+        "employee_id": u, "label": label[u], "role": role_of[u],
         "tickets": sum(u in m for m in team.values()),
         "scored_tickets": len(user_r.get(u, [])),
         "efficiency": round(user_eff.get(u, 0.0), 3),
@@ -236,7 +215,7 @@ def write_spmf(path_txt, path_items, team, ticket_by_id):
     """HUIM input in SPMF format: `items:TU:utilities` per ticket.
 
     Utility of a user on a ticket = their share of the ticket's value, where
-    value = estimate * min(2, estimate / team_hours), estimate = dev + QC estimate, / (1 + reopening_times):
+    value = allocated_hours * min(2, allocated_hours / team_hours) / (1 + reopen_count):
     delivering the estimated scope faster and without reopen is worth more.
     Scaled x10 to integers.
     """
@@ -244,18 +223,18 @@ def write_spmf(path_txt, path_items, team, ticket_by_id):
     lines = []
     for tid, members in sorted(team.items()):
         t = ticket_by_id[tid]
-        est = float(t["development_time"] or 0) + float(t.get("qc_estimate") or 0)
-        if t["state"] != "closed" or est <= 0:
+        est = float(t["allocated_hours"] or 0)
+        if t["state"] != DONE or est <= 0:
             continue
         total = sum(members.values())
-        value = est * min(2.0, est / total) / (1 + int(t["reopening_times"]))
+        value = est * min(2.0, est / total) / (1 + reopen_count(t))
         utils = sorted((item_id[u], max(1, round(10 * value * h / total))) for u, h in members.items())
         lines.append(f"{' '.join(str(i) for i, _ in utils)}:{sum(x for _, x in utils)}:"
                      f"{' '.join(str(x) for _, x in utils)}")
     Path(path_txt).write_text("\n".join(lines) + "\n")
     with open(path_items, "w", newline="") as f:
         w = csv.writer(f, lineterminator="\n")
-        w.writerow(["item", "user_id"])
+        w.writerow(["item", "employee_id"])
         w.writerows((i, u) for u, i in item_id.items())
     return len(lines)
 
@@ -269,7 +248,7 @@ def write_rows(path, rows):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--data", default="data/sample", type=Path, help="folder with users, tickets, work_entries CSVs")
+    p.add_argument("--data", default="data/sample", type=Path, help="folder with hr_employee, project_task, account_analytic_line CSVs")
     p.add_argument("--out", default="reports", type=Path, help="output folder")
     p.add_argument("--roles", default="dev,tpm,qa", help="comma-separated roles to include (default: dev,tpm,qa)")
     p.add_argument("--min-hours", default=0.5, type=float, help="min hours on a ticket to count as member")
@@ -282,7 +261,7 @@ def main():
     args = p.parse_args()
 
     groups, users_, ctx = analyze(*load(args.data), roles=tuple(args.roles.split(",")),
-                                  min_hours=args.min_hours, shrink=args.shrink, salt=os.environ.get(SALT_ENV))
+                                  min_hours=args.min_hours, shrink=args.shrink)
     args.out.mkdir(parents=True, exist_ok=True)
     write_rows(args.out / "groups.csv", groups)
     if args.show_individuals:
