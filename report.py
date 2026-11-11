@@ -36,6 +36,10 @@ h3 { font-size:12px; font-weight:600; color:var(--text2); text-transform:upperca
 .bar { position:absolute; top:0; height:16px; }
 .bar.neg { right:50%; border-radius:4px 0 0 4px; background:var(--good); }
 .bar.pos { left:50%; border-radius:0 4px 4px 0; background:var(--bad); }
+.bar.noise { background:var(--neutral); }
+.ci { position:absolute; top:7px; height:2px; background:var(--text2); }
+.ci::before, .ci::after { content:""; position:absolute; top:-4px; height:10px; border-left:2px solid var(--text2); }
+.ci::before { left:0; } .ci::after { right:0; }
 .axis { display:grid; grid-template-columns:minmax(150px,340px) 1fr 64px; gap:8px; color:var(--muted); font-size:11px; }
 .axis div:nth-child(2) { display:flex; justify-content:space-between; }
 @media (max-width:600px) {
@@ -100,6 +104,10 @@ net && net.querySelectorAll('.node').forEach(n => {
 """
 
 
+HOURS_CI = ("hours_ci_low_pct", "hours_ci_high_pct")
+REOPEN_CI = ("reopen_ci_low", "reopen_ci_high")
+
+
 def pct(v):
     return f"{v:+.1f}%"
 
@@ -114,21 +122,27 @@ def member_list(labels):
 
 
 def diverging_rows(items, limit=None, fmt=None, split=("Best", "Worst")):
-    """items: (name_html, pct_value, tooltip_html). Negative = fewer hours = good (blue).
+    """items: (name_html, value, tooltip_html[, (ci_low, ci_high)]). Negative = fewer hours = good (blue).
+    A row whose interval crosses 0 is drawn gray (could be noise), with the interval as a whisker.
     With limit, rows before it go under split[0], the rest under split[1]."""
     if not items:
         return '<p class="note">Not enough data.</p>'
-    scale = max(abs(v) for _, v, _ in items) or 1
+    scale = max(max(abs(x) for x in (it[1], *(it[3] if len(it) > 3 else ()))) for it in items) or 1
     fmt = fmt or pct
     scale = math.ceil(scale / 5) * 5 if scale >= 1 else math.ceil(scale * 10) / 10
     out = []
-    for i, (label, v, tip) in enumerate(items):
+    for i, (label, v, tip, *ci) in enumerate(items):
         if limit and i in (0, limit):
             out.append(f'<div class="split">{escape(split[i > 0])}</div>')
         side = "neg" if v < 0 else "pos"
+        whisker = ""
+        if ci:
+            lo, hi = ci[0]
+            side += " noise" if lo <= 0 <= hi else ""
+            whisker = f'<div class="ci" style="left:{50 + lo / scale * 50:.2f}%;width:{(hi - lo) / scale * 50:.2f}%"></div>'
         out.append(
             f'<div class="row" data-tip="{escape(tip)}"><div class="name">{label}</div>'
-            f'<div class="track"><div class="bar {side}" style="width:{abs(v) / scale * 50:.2f}%"></div></div>'
+            f'<div class="track"><div class="bar {side}" style="width:{abs(v) / scale * 50:.2f}%"></div>{whisker}</div>'
             f'<div class="val">{fmt(v)}</div></div>')
     out.append(f'<div class="axis"><div></div><div><span>{fmt(-scale)}</span><span>0</span>'
                f'<span>{fmt(scale)}</span></div><div></div></div>')
@@ -174,12 +188,12 @@ def network_svg(pairs, users, label, team, ticket_by_id, min_edge, min_shared):
 
     # Neutral edges first so coloured ones draw on top.
     edges = sorted((p for p in pairs if p["shared_tickets"] >= min_edge and p["user_a"] in pos and p["user_b"] in pos),
-                   key=lambda p: (p["scored_tickets"] >= min_shared and abs(p["hours_vs_expected_pct"]) >= 5, p["jaccard"]))
+                   key=lambda p: (p["scored_tickets"] >= min_shared and p["hours_significant"], p["jaccard"]))
     for p in edges:
         (x1, y1), (x2, y2) = xy(pos[p["user_a"]]), xy(pos[p["user_b"]])
         scored = p["scored_tickets"] >= min_shared
         v = p["hours_vs_expected_pct"]
-        strong = scored and abs(v) >= 5
+        strong = scored and p["hours_significant"]
         color = ("var(--good)" if v < 0 else "var(--bad)") if strong else "var(--neutral)"
         opacity = min(1.0, 0.45 + abs(v) / 25) if strong else 0.7
         width = 1.5 + 14 * p["jaccard"]
@@ -201,8 +215,9 @@ def network_svg(pairs, users, label, team, ticket_by_id, min_edge, min_shared):
         left = math.cos(a) < 0
         deg = math.degrees(a) + (180 if left else 0)
         anchor = "end" if left else "start"
-        eff = users.get(u, {}).get("hours_vs_expected_pct", 0)
-        tip = f"<b>{escape(label[u])}</b>{escape(main_proj[u])}, {n} tickets<br>Individual: {pct(eff)} hours vs expected"
+        tip = f"<b>{escape(label[u])}</b>{escape(main_proj[u])}, {n} tickets"
+        if u in users:
+            tip += f"<br>Individual: {pct(users[u]['hours_vs_expected_pct'])} hours vs expected"
         parts.append(f'<g class="node" data-u="{u}" data-tip="{escape(tip)}">'
                      f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{5 + math.sqrt(n) * 0.9:.1f}"/>'
                      f'<text x="{lx:.1f}" y="{ly:.1f}" text-anchor="{anchor}" dominant-baseline="middle" font-size="12" '
@@ -214,9 +229,8 @@ def network_svg(pairs, users, label, team, ticket_by_id, min_edge, min_shared):
 
 def render(groups, users, ctx, args):
     team, ticket_by_id, label = ctx["team"], ctx["ticket_by_id"], ctx["label"]
-    user_map = {u["user_id"]: u for u in users}
+    user_map = {u["user_id"]: u for u in users} if args.show_individuals else {}
     rated = [g for g in groups if g["scored_tickets"] >= args.min_shared]
-    multi = sum(len(m) >= 2 for m in team.values())
     pairs = []
     for g in groups:
         if g["size"] == 2:
@@ -229,14 +243,17 @@ def render(groups, users, ctx, args):
     def g_tip(g):
         names = "<br>".join(escape(x) for x in g["member_labels"].split(" + "))
         return (f"<b>{names}</b>{g['scored_tickets']} closed estimated tickets, {g['shared_tickets']} shared tickets<br>"
-                f"Hours vs apart: {pct(g['hours_vs_expected_pct'])}, reopens vs apart: {g['reopen_vs_expected']:+.2f}/ticket<br>"
+                f"Hours vs apart: {pct(g['hours_vs_expected_pct'])} "
+                f"(95% CI {pct(g['hours_ci_low_pct'])} to {pct(g['hours_ci_high_pct'])})<br>"
+                f"Reopens vs apart: {g['reopen_vs_expected']:+.2f}/ticket "
+                f"(95% CI {g['reopen_ci_low']:+.2f} to {g['reopen_ci_high']:+.2f})<br>"
                 f"Avg reopen: {g['reopen_avg']} (overall: {ctx['reopen_avg']:.2f})")
 
-    def best_worst(rows, key, fmt=None, split=("Faster together", "Slower together")):
+    def best_worst(rows, key, ci, fmt=None, split=("Faster together", "Slower together")):
         n = args.top // 2 or 1
         rows = sorted(rows, key=lambda g: g[key])
         best, worst = rows[:n], [g for g in rows[-n:] if g not in rows[:n]]
-        items = [(g_label(g), g[key], g_tip(g)) for g in best + worst]
+        items = [(g_label(g), g[key], g_tip(g), (g[ci[0]], g[ci[1]])) for g in best + worst]
         return diverging_rows(items, limit=len(best) if worst else None, fmt=fmt, split=split)
 
     def together(mix_size):
@@ -257,9 +274,19 @@ def render(groups, users, ctx, args):
                    f"{u['tickets']} tickets total<br>Avg reopen: {u['reopen_avg']}") for u in users if u["scored_tickets"]]
 
     cols = ["size", "member_labels", "role_mix", "shared_tickets", "jaccard", "lift", "scored_tickets",
-            "hours_vs_expected_pct", "reopen_vs_expected", "reopen_avg"]
+            "hours_vs_expected_pct", "hours_ci_low_pct", "hours_ci_high_pct",
+            "reopen_vs_expected", "reopen_ci_low", "reopen_ci_high", "reopen_avg"]
     heads = ["Size", "Members", "Roles", "Shared tickets", "Jaccard", "Lift", "Scored tickets",
-             "Hours vs apart %", "Reopens vs apart", "Avg reopen"]
+             "Hours vs apart %", "95% low", "95% high", "Reopens vs apart", "95% low", "95% high", "Avg reopen"]
+    clear = sum(g["hours_significant"] for g in rated)
+    individuals = f"""<div class="card">
+  <h2>Individual baseline</h2>
+  <p class="note">Hours compared with tickets of the same project and team size, across all of a person's tickets.
+  Shown because <code>--show-individuals</code> was passed. Not a performance rating.</p>
+  {diverging_rows(user_items, limit=sum(v < 0 for _, v, _ in user_items) or None,
+                  split=("Faster than comparable tickets", "Slower than comparable tickets"))}
+</div>
+""" if args.show_individuals else ""
     def cell(g, c):
         return member_list(g[c].split(" + ")) if c == "member_labels" else escape(str(g[c]))
 
@@ -281,6 +308,7 @@ at least {args.min_hours}h logged on a ticket to count as a member</p>
   <div class="tile"><b>{sizes[3]}</b><span>tickets with 3 people</span></div>
   <div class="tile"><b>{sizes[2]} / {sizes[4]}</b><span>tickets with 2 / 4+ people</span></div>
   <div class="tile"><b>{len(rated)}</b><span>pairs &amp; trios with enough data</span></div>
+  <div class="tile"><b>{clear}</b><span>of them clearly faster or slower (95%)</span></div>
 </div>
 
 <div class="card">
@@ -295,12 +323,15 @@ at least {args.min_hours}h logged on a ticket to count as a member</p>
       <code>n<sub>A</sub> * n<sub>B</sub> / n<sub>project</sub></code> (trio: <code>n<sub>A</sub>n<sub>B</sub>n<sub>C</sub> / n<sub>project</sub><sup>2</sup></code>),
       i.e. how often they would meet if staffed at random. &gt; 1 = together more than chance. With only 2 or 3 people per
       ticket it stays near 1, so Jaccard is used for ranking.</dd>
-    <dt>Scored tickets</dt><dd>Shared tickets that are closed and have a dev estimate. Only these count for hours and
+    <dt>Closed &amp; estimated</dt><dd>Shared tickets that are closed and have a dev estimate. Only these count for hours and
       reopens; groups need {args.min_shared}+ to be rated.</dd>
     <dt>Hours vs apart</dt><dd>Per ticket: <code>ln(team hours / (dev estimate + QC estimate))</code>, minus the average of
       tickets in the same project and team size. Group value = average on shared tickets minus each member's average on
       tickets <i>without</i> the others, shown as %. -15% means about 15% fewer hours together than apart.</dd>
     <dt>Reopens vs apart</dt><dd>Same, using <code>reopening_times</code>. -0.20 = 0.2 fewer reopens per ticket together.</dd>
+    <dt>95% interval</dt><dd>Range the true value likely falls in, from the spread of the tickets behind it
+      (shown as a whisker on each bar). If it crosses 0 the bar is <b>gray</b>: the difference could be noise.
+      With {len(rated)} groups rated, about {round(len(rated) * 0.05)} will still look clear by chance.</dd>
     <dt>Avg reopen</dt><dd>Plain average of <code>reopening_times</code> on the group's scored tickets
       (overall: {ctx['reopen_avg']:.2f}).</dd>
     <dt>Shrinkage</dt><dd>Averages are <code>sum / (n + {args.shrink:g})</code> instead of <code>sum / n</code>, so a group with
@@ -315,7 +346,7 @@ at least {args.min_hours}h logged on a ticket to count as a member</p>
   <div class="legend">
     <span><i class="sw" style="background:var(--good)"></i>Faster together than apart</span>
     <span><i class="sw" style="background:var(--bad)"></i>Slower together than apart</span>
-    <span><i class="sw" style="background:var(--neutral)"></i>Within +/-5% or fewer than {args.min_shared} tickets</span>
+    <span><i class="sw" style="background:var(--neutral)"></i>Could be noise (95% interval crosses 0) or fewer than {args.min_shared} tickets</span>
     <span>Only pairs with {args.min_edge}+ shared tickets are drawn</span>
   </div>
   {network_svg(pairs, user_map, label, team, ticket_by_id, args.min_edge, args.min_shared)}
@@ -327,20 +358,20 @@ at least {args.min_hours}h logged on a ticket to count as a member</p>
   each member working without the other two, on comparable tickets (same project and team size).
   <b style="color:var(--good)">Negative</b> = faster together. <b style="color:var(--bad)">Positive</b> = slower.
   Only trios with {args.min_shared}+ closed, estimated shared tickets.</p>
-  {best_worst([g for g in rated if g["size"] == 3], "hours_vs_expected_pct")}
+  {best_worst([g for g in rated if g["size"] == 3], "hours_vs_expected_pct", HOURS_CI)}
 </div>
 
 <div class="card">
   <h2>Best and worst pairs: hours</h2>
   <p class="note">Same measure for any two people: Developer + Developer, Developer + QC, Developer + TPM, TPM + QC.</p>
-  {best_worst([g for g in rated if g["size"] == 2], "hours_vs_expected_pct")}
+  {best_worst([g for g in rated if g["size"] == 2], "hours_vs_expected_pct", HOURS_CI)}
 </div>
 
 <div class="card">
   <h2>Quality: fewest and most reopens</h2>
   <p class="note">Fewer hours only counts if the ticket doesn't come back. Reopens per ticket compared with the members
   working apart. <b style="color:var(--good)">Negative</b> = fewer reopens together. Pairs and trios combined.</p>
-  {best_worst(rated, "reopen_vs_expected", fmt=lambda v: f"{v:+.2f}", split=("Fewer reopens", "More reopens"))}
+  {best_worst(rated, "reopen_vs_expected", REOPEN_CI, fmt=lambda v: f"{v:+.2f}", split=("Fewer reopens", "More reopens"))}
 </div>
 
 <div class="card">
@@ -350,18 +381,12 @@ at least {args.min_hours}h logged on a ticket to count as a member</p>
   {together(3)}
 </div>
 
-<div class="card">
-  <h2>Individual baseline</h2>
-  <p class="note">Hours compared with tickets of the same project and team size, across all of a person's tickets.</p>
-  {diverging_rows(user_items, limit=sum(v < 0 for _, v, _ in user_items) or None,
-                  split=("Faster than comparable tickets", "Slower than comparable tickets"))}
-</div>
-
+{individuals}
 <div class="card">
   <h2>How to read this</h2>
-  <p class="note">Treat these as hints to look into, not verdicts. Groups with under ~10 shared tickets can be off by
-  +/-10% from noise. Effects that only touch one part of the work (e.g. QC time, ~15% of a ticket) are hard to see in
-  total hours. Estimates are set by PMs and carry their own bias. Do not use this to rank or evaluate individuals.</p>
+  <p class="note">Treat these as hints to look into, not verdicts. Gray bars may be noise. A colored bar
+  means the difference is stable, not that the pair causes it: who gets staffed on which tickets matters too.
+  Effects that only touch one part of the work (e.g. QC time, ~15% of a ticket) are hard to see in total hours. Estimates are set by PMs and carry their own bias. Do not use this to rank or evaluate individuals.</p>
   <details><summary>Full table of all pairs and trios ({len(groups)})</summary>
   <div class="tablewrap"><table><thead><tr>{"".join(f"<th>{h}</th>" for h in heads)}</tr></thead>
   <tbody>{table}</tbody></table></div></details>

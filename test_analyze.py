@@ -1,8 +1,10 @@
 """Run: python3 -m unittest -v"""
 
+import argparse
 import unittest
 
 import analyze
+import report
 import generate_sample as gen
 
 
@@ -44,6 +46,31 @@ class TestPlantedTruth(unittest.TestCase):
     def test_bad_dev_qc_pair_slow_and_reopens(self):
         self.assertGreaterEqual(rank(self.pairs, "son.kieu + trang.vo"), len(self.pairs) - 3)
         self.assertGreaterEqual(rank(self.quality, "son.kieu + trang.vo"), len(self.quality) - 10)
+
+    def test_planted_groups_are_clear(self):
+        for members in ("dung.pham + linh.ly", "giang.hoang + khoa.truong + yen.quach", "son.kieu + trang.vo"):
+            r = self.groups[find(self.groups, members)]
+            self.assertTrue(r["hours_significant"], members)
+            self.assertLessEqual(r["hours_ci_low_pct"], r["hours_vs_expected_pct"])
+            self.assertLessEqual(r["hours_vs_expected_pct"], r["hours_ci_high_pct"])
+
+    def test_uniform_small_sample_not_overconfident(self):
+        # ~7 tickets with 0 reopens is common at a 0.14 base rate; must not read as a clear effect.
+        zero = [r for r in self.groups if r["scored_tickets"] >= 5 and r["reopen_avg"] == 0.0]
+        self.assertTrue(zero)
+        self.assertFalse([r["members"] for r in zero if r["reopen_significant"]])
+
+    def test_individuals_hidden_by_default(self):
+        tickets, entries = gen.generate(seed=42)
+        users = [{"user_id": str(gen.USER_ID[u[0]]), "login": u[0], "name": u[1], "role": u[2]} for u in gen.USERS]
+        groups, users_out, ctx = analyze.analyze(users, [{k: str(v) for k, v in t.items()} for t in tickets], entries)
+        args = argparse.Namespace(data="x", roles="dev,tpm,qa", min_hours=0.5, min_shared=5, shrink=5.0, top=8,
+                                  min_edge=3, show_individuals=False)
+        html = report.render(groups, users_out, ctx, args)
+        self.assertNotIn("Individual baseline", html)
+        self.assertNotIn("Individual:", html)
+        args.show_individuals = True
+        self.assertIn("Individual baseline", report.render(groups, users_out, ctx, args))
 
     def test_rare_pair_not_rated(self):
         r = self.groups[find(self.groups, "hieu.bui + lam.duong")]

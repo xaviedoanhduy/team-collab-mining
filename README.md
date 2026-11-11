@@ -1,115 +1,171 @@
 # team-collab-mining
 
-From per-ticket working hours, find **who works together** and **which pairs and
-trios deliver tickets more efficiently**. Ships with a synthetic dataset; any
-time-tracking export mapped to the CSV format below works.
+Find out, from per-ticket working hours:
 
-Stdlib only, Python 3.10+. No install.
+- **who works together** most often, and
+- **which pairs and trios finish tickets faster** (or slower, or with more reopens) than the same
+  people do apart.
+
+Python 3.10+, standard library only, nothing to install. Ships with a synthetic dataset so you can
+try it in one minute.
+
+![Report: metric glossary and collaboration network](docs/report.png)
+
+## Quick start
 
 ```bash
-python3 generate_sample.py      # (re)build data/sample/ (seeded, deterministic)
-python3 analyze.py              # prints top pairs, writes reports/ (open reports/report.html)
-python3 -m unittest -v          # checks the analysis recovers the planted pairs
+git clone git@github.com:xaviedoanhduy/team-collab-mining.git
+cd team-collab-mining
+python3 analyze.py              # analyze data/sample/, print a summary, write reports/
+xdg-open reports/report.html    # macOS: open reports/report.html
 ```
 
-Options: `python3 analyze.py --help` (`--roles dev,tpm,qa`, `--min-hours`, `--min-shared`, `--min-edge`, `--shrink`, `--top`, `--data`).
+The terminal shows the strongest results; the HTML report has everything, with charts and hover
+details. Other commands:
 
-## Input format (`data/sample/`)
+```bash
+python3 generate_sample.py      # rebuild data/sample/ (same seed, same data)
+python3 -m unittest -v          # check the analysis still finds the effects planted in the sample
+```
 
-**users.csv**: `user_id, login, name, role` (role: `pm | tpm | dev | qa | consultant`; `qa` is shown as QC)
+## Use your own data
 
-`user_id` is a numeric user id; all processing is keyed on it. If the column is missing or empty,
-a 48-bit id is derived as `HMAC-SHA256(salt, name|login)`, with the secret salt from `TEAM_MINING_SALT`
-(required in that case, the run stops otherwise). The same salt gives the same id across exports; without the salt the
-id can't be recomputed from a user list. Keep the salt out of git and away from the exported files.
+Put three CSV files in a folder and run `python3 analyze.py --data path/to/folder`.
+Only the **bold** columns are required; extra columns are ignored.
+
+**users.csv** (one row per person)
+
+| column | meaning |
+|---|---|
+| **user_id** | numeric id (see [User ids](#user-ids) if you don't have one) |
+| **role** | `dev`, `tpm`, `qa`, `pm` or `consultant` (`qa` is shown as QC) |
+| login, name | only used for labels in the report: `Name (login) - Role` |
+
+**tickets.csv** (one row per ticket)
+
+| column | meaning |
+|---|---|
+| **id** | ticket id |
+| **project** | tickets are only compared within the same project |
+| **state** | only `closed` tickets count for hours and reopens |
+| **development_time** | dev estimate in hours; `0` or empty = not estimated (skipped) |
+| **reopening_times** | how many times the ticket was reopened |
+| qc_estimate | QC estimate in hours, added to the dev estimate |
+
+**work_entries.csv** (one row per time entry)
+
+| column | meaning |
+|---|---|
+| **ticket_id** or **task_id** | ticket the time was logged on; empty = skipped |
+| **user_id** | who logged it |
+| **duration_hour** | hours |
+
+Do not export free-text fields (ticket titles, entry descriptions): the analysis doesn't need them
+and they are the easiest way to leak client details.
+
+### User ids
+
+If `users.csv` has no `user_id`, one is derived from `HMAC-SHA256(salt, name|login)`. The salt is
+a secret you keep outside the repo and outside the exported files:
 
 ```bash
 export TEAM_MINING_SALT="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"  # once, store it safely
 ```
 
-**tickets.csv** (one row per ticket)
+The same salt always gives the same id, and without it nobody can map ids back to people.
+Without `user_id` and without the salt, the run stops with an error.
 
-| column | note |
+## Reading the results
+
+| metric | meaning |
 |---|---|
-| id | |
-| project, activity, state, priority | `state = closed` is required to score efficiency |
-| owner_id, developer_id | numeric user ids |
-| development_time | dev estimate (h), `0` = not estimated (skipped) |
-| qc_estimate | QC estimate (h), 20 % of dev estimate in the sample |
-| time_spent, sum_qc_time, fixing_time_spent | hours of all / `qa` / `fixing` entries |
-| reopening_times | |
-| create_date, closing_datetime | empty closing = still open |
+| shared tickets | tickets where every member of the group logged at least `--min-hours` |
+| Jaccard | shared tickets / tickets with any of them. 0 = never together, 1 = always together. Compare within one role mix only: a TPM reviews most of a project, so Developer + TPM is naturally high. |
+| hours vs apart | e.g. `-15%`: the group needs about 15% fewer hours together than its members need apart, on comparable tickets |
+| reopens vs apart | e.g. `-0.16`: 0.16 fewer reopens per ticket together than apart |
+| 95% CI | range the true value likely falls in. If it crosses 0 the result is marked **could be noise** (gray in the report). |
+| closed & estimated | shared tickets used for hours and reopens; a group needs `--min-shared` (5) of them to be rated |
 
-**work_entries.csv** (one row per time entry)
+A colored (clear) result means the difference is stable, not that the pair causes it: who gets
+staffed on which tickets matters too. Treat results as hints to look into, not verdicts.
 
-`id, ticket_id, project, user_id, date, duration_hour, dev_type`
+### Outputs in `reports/`
 
-Free-text `name` (ticket title, work entry description) is not exported: not needed, and the easiest field
-to leak client details through.
+| file | content |
+|---|---|
+| `report.html` | single page, no dependencies, light and dark: glossary, network, best/worst trios and pairs, reopens, most-together, full table |
+| `groups.csv` | one row per pair or trio with every metric above, including `*_ci_low`, `*_ci_high`, `*_significant` |
+| `huim_spmf.txt`, `huim_items.csv` | the same tickets in SPMF format (`items:TU:utilities`) for high-utility itemset mining tools |
+| `users.csv` | only with `--show-individuals` |
 
-- Ticket column: `ticket_id` or `task_id`; the first non-empty one is used. Entries linked to no ticket are skipped.
-- User column: `user_id` only (required). Logins never appear in work entries.
+## Options
 
-`dev_type`: `new_feature` (coding), `fixing` (after reopen), `qa` (QC), `other` (review, PM, consulting).
-
-## Method
-
-1. **Team of a ticket** = users of the chosen roles (default `dev,tpm,qa`) who logged at least `--min-hours`.
-   Typical team: 1 or 2 developers, the project's TPM (code review) and a QC: 3 people, 2 without review.
-   PMs are excluded by default (short touches on many tickets).
-2. **Groups** = every pair and trio inside a ticket's team.
-3. **Together**: Jaccard over multi-person tickets. Compare within one role mix only: a TPM reviews
-   most of a project's tickets, so Developer + TPM is naturally higher than Developer + Developer.
-4. **Hours**: `ln(team hours / (dev estimate + QC estimate))` on closed, estimated tickets, minus the
-   mean of tickets in the same project and team size, giving the residual. Negative = faster than comparable work.
-5. **Quality**: `reopening_times`, residual the same way. Fewer hours with more reopens isn't efficient.
-6. **Synergy** of a group = its shared-ticket residual minus the average residual of each member on
-   tickets **without the other members**: "are they better together than apart?". Using all of a
-   member's tickets instead would leak the group's own effect into the baseline.
-   Means are shrunk (`sum / (n + shrink)`) so groups with few shared tickets don't top the list.
-
-`hours_vs_expected_pct = -15` means about 15 % fewer hours together than apart. `reopen_vs_expected = -0.16` means
-0.16 fewer reopens per ticket.
-
-## Outputs (`reports/`)
-
-- `report.html`: self-contained page (no deps, light/dark): metric glossary, collaboration network grouped by
-  project, best/worst trios and pairs (hours), fewest/most reopens, most-together per role mix,
-  individual baseline, full table. Hover for details.
-- `groups.csv`: size, members (user ids), `Name (login) - Role` labels, role_mix, shared_tickets, any_tickets (Jaccard denominator), jaccard, lift,
-  scored_tickets, synergy, hours_vs_expected_pct, reopen_vs_expected, reopen_avg
-- `users.csv`: user_id, label, role, individual hours and reopen
-- `huim_spmf.txt` + `huim_items.csv` (`item, user_id`): HUIM input in SPMF format (`items:TU:utilities`).
-  Utility of a user on a ticket = their hour share of
-  `estimate * min(2, estimate / team_hours) / (1 + reopening_times)` times 10 (estimate = dev + QC),
-  so faster delivery without reopen is worth more.
-
-## Sample dataset: planted truth
-
-930 tickets, ~5.9k entries, 5 projects, 29 users (3 PM, 4 TPM, 16 dev, 4 QC, 2 consultants),
-Jan 2025 to Oct 2026. Team sizes: 573 tickets with 3 people, 232 with 4, 93 with 2. Realistic noise: individual speed
-varies, ~6 % tickets unestimated, ~10 % still open, big tickets more often get 2 devs, review lowers
-reopens, PM touches of 0.25 h (below the member threshold), one project without QC.
-
-| group | planted | analysis finds |
+| option | default | meaning |
 |---|---|---|
-| dung.pham + linh.ly (Dev + Dev) | 0.7x dev hours, 0.5x reopen | best pair (-15 %) |
-| khanh.ngo + phong.nghiem + thao.phan (Dev + TPM + QC) | 0.75x all hours, 0.4x reopen | 3rd best trio (-14 %), its pairs top-3 |
-| giang.hoang + khoa.truong + yen.quach (Dev + TPM + QC) | 1.35x all hours, 1.8x reopen | worst trio (+26 %) |
-| son.kieu + trang.vo (Dev + QC) | 1.5x QC hours, 1.8x reopen | 2nd worst pair (+19 %), near-worst reopens |
-| long.mai + ngoc.ha (Dev + Dev) | often staffed together | top Jaccard among Dev + Dev |
-| hieu.bui + lam.duong (Dev + Dev) | 1.45x hours, 2x reopen | **not rated**: only 2 shared tickets |
-| hoa.do + thao.phan (Dev + QC) | 0.6x QC hours, 0.4x reopen | **missed** (-2 %): QC is ~15 % of ticket hours |
+| `--data` | `data/sample` | folder with the three CSV files |
+| `--out` | `reports` | output folder |
+| `--roles` | `dev,tpm,qa` | roles that count as team members (PMs only touch tickets briefly) |
+| `--min-hours` | `0.5` | hours on a ticket to count as a member |
+| `--min-shared` | `5` | closed & estimated shared tickets needed to rate a group |
+| `--shrink` | `5` | pulls small groups toward 0 so luck doesn't top the list |
+| `--top` | `8` | rows per best/worst list |
+| `--min-edge` | `3` | shared tickets needed to draw a link in the network |
+| `--show-individuals` | off | also rank individuals; off because this is a team tool, not a rating |
 
-The last two rows are the method's real limits: rare combinations can't be judged, and effects on
-only one part of the work drown in total-hours noise. A per-role metric (`sum_qc_time / qc_estimate`
-for Dev + QC) would catch the latter; not built yet. Some unplanted groups also show +/-10 %: noise at
-~10 shared tickets. Treat results as hints to look into, not verdicts.
+## How it works
 
-## Caveats before real data
+1. **Team of a ticket**: users of the chosen roles who logged at least `--min-hours` on it.
+   A typical ticket: 1 or 2 developers, the project's TPM (code review) and a QC.
+2. **Groups**: every pair and trio inside a team.
+3. **Hours per ticket**: `ln(team hours / (dev estimate + QC estimate))`, minus the average of
+   tickets in the same project with the same team size. This residual is negative when the
+   ticket went faster than comparable work.
+4. **Reopens per ticket**: `reopening_times`, residual computed the same way.
+5. **Together vs apart**: the group's average residual on shared tickets, minus each member's
+   average on tickets **without the other members**. Using all of a member's tickets would mix
+   the group's own effect into its baseline. Averages are `sum / (n + shrink)`.
+6. **95% interval**: shared and apart tickets are separate sets, so their variances add. Each set
+   uses at least the variance of all scored tickets, so a small uniform set (7 tickets, 0 reopens)
+   doesn't get a falsely narrow interval. With ~150 groups rated, about 5% look clear by chance.
 
-- Working hours are personal data; present results as team-composition hints, not individual rankings.
-- If people learn the metric, logging behaviour changes. Estimates are made by PMs and are biased too.
+## Does it work? The sample dataset
+
+`data/sample/` is synthetic: 930 tickets, 5 projects, 29 people, Jan 2025 to Oct 2026, with
+realistic noise (individual speed, unestimated and open tickets, 2-dev tickets, one project without
+QC). A few groups have effects planted on purpose; the tests check the analysis finds them.
+
+| planted group | planted effect | analysis finds |
+|---|---|---|
+| dung.pham + linh.ly (Dev + Dev) | 0.7x dev hours, 0.5x reopens | best of 78 pairs, -15% (CI -24% to -5%) |
+| khanh.ngo + phong.nghiem + thao.phan (Dev + TPM + QC) | 0.75x hours, 0.4x reopens | 3rd of 67 trios, -14%; fewest-reopens pair inside it |
+| giang.hoang + khoa.truong + yen.quach (Dev + TPM + QC) | 1.35x hours, 1.8x reopens | worst trio, +26% (CI +15% to +38%) |
+| son.kieu + trang.vo (Dev + QC) | 1.5x QC hours, 1.8x reopens | 2nd worst pair, +19%; reopens +0.19 but could be noise |
+| long.mai + ngoc.ha (Dev + Dev) | usually staffed together | highest Jaccard among Dev + Dev |
+| hieu.bui + lam.duong (Dev + Dev) | 1.45x hours, 2x reopens | **not rated**: only 1 closed & estimated shared ticket |
+| hoa.do + thao.phan (Dev + QC) | 0.6x QC hours, 0.4x reopens | **missed**: QC is ~15% of a ticket's hours |
+
+Known limits, all visible above:
+
+- Rare combinations can't be judged.
+- Reopens are a weak signal (0.14 per ticket on average); most planted reopen effects stay "could be noise".
+- An effect on one part of the work (QC time only) drowns in total hours.
+- Some unplanted groups look clear because they share a member with a planted group.
+
+## Before using real data
+
+- Working hours are personal data. Agree on the purpose with the people concerned first, and
+  present results as team-composition hints, never as individual ratings.
+- Once people know the metric, the way they log time changes.
+- Estimates are set by people and carry their own bias.
+
+## Project layout
+
+| file | purpose |
+|---|---|
+| `analyze.py` | loading, analysis, terminal summary, CSV and SPMF output |
+| `report.py` | the HTML report |
+| `generate_sample.py` | synthetic dataset with planted effects |
+| `test_analyze.py` | tests against the planted effects |
 
 ## License
 
