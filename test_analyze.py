@@ -4,6 +4,7 @@ import argparse
 import unittest
 
 import analyze
+import odoo_extract
 import report
 import generate_sample as gen
 
@@ -100,6 +101,24 @@ class TestSmall(unittest.TestCase):
         self.assertEqual(groups[0]["member_labels"], "A A - Developer + #2 - QC")
         self.assertEqual(groups[0]["synergy"], 0.0)  # one ticket, one bucket: residual 0
         self.assertEqual({r["employee_id"] for r in users_out}, {1, 2})
+
+
+class TestOdooExtract(unittest.TestCase):
+    def test_pseudonym(self):
+        p = odoo_extract.pseudonym
+        self.assertEqual(p("s1", "employee", 7), p("s1", "employee", 7))
+        self.assertNotEqual(p("s1", "employee", 7), p("s2", "employee", 7))
+        self.assertNotEqual(p("s1", "employee", 7), p("s1", "task", 7))
+
+    def test_reopen_counts(self):
+        done, cancel, todo, wip = 4, 5, 1, 2  # done and cancelled are folded
+        changes = [(10, todo, wip), (10, wip, done), (10, done, wip), (10, wip, done),  # reopened once
+                   (11, done, cancel),                                                # folded to folded: not a reopen
+                   (12, done, todo), (12, todo, done), (12, done, wip)]               # twice
+        self.assertEqual(odoo_extract.reopen_counts(changes, {done, cancel}), {10: 1, 12: 2})
+
+    def test_role_map(self):
+        self.assertEqual(odoo_extract.parse_role_map(" Developer=dev, Tester = qa,"), {"developer": "dev", "tester": "qa"})
 
 
 if __name__ == "__main__":

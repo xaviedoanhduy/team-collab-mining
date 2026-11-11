@@ -6,8 +6,8 @@ Find out, from per-ticket working hours:
 - **which pairs and trios finish tasks faster** (or slower, or with more reopens) than the same
   people do apart.
 
-Python 3.10+, standard library only, nothing to install. Reads the Odoo 17+ project and timesheet
-schema, and ships with a synthetic dataset so you can try it in one minute.
+Python 3.10+, standard library only, nothing to install. Reads Odoo 17+ projects and timesheets
+directly, and ships with a synthetic dataset so you can try it in one minute.
 
 ![Report: metric glossary and collaboration network](docs/report.png)
 
@@ -32,6 +32,30 @@ python3 -m unittest -v          # check the analysis still finds the effects pla
 
 The input follows the standard Odoo 17+ models of the `project` and `hr_timesheet` modules, one CSV
 per model. Other tools work too, as long as you produce the same columns.
+
+### From Odoo
+
+`odoo_extract.py` reads the data over XML-RPC (no module to install on the server) and writes the
+three files:
+
+```bash
+export ODOO_PASSWORD=...                     # password or API key; asked if unset
+export TEAM_MINING_SALT="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"  # optional, see below
+python3 odoo_extract.py --url https://odoo.example.com --db prod --user me@example.com \
+    --role-map "Developer=dev,Technical Lead=tpm,Tester=qa" --since 2025-01-01
+python3 analyze.py --data data/odoo
+```
+
+- **Roles** come from the employee's job title (`job_title`, else `job_id`). `--role-map` turns
+  titles into the roles the analysis knows; the script lists the titles it could not map.
+- **Reopens** are not a field in Odoo: the script counts how often a task left a folded (closed)
+  stage, from the chatter's stage history. That needs admin rights; without them `reopen_count` is
+  left empty and only hours are analyzed.
+- **Pseudonymized ids**: with `TEAM_MINING_SALT` set, every employee, task and project id is replaced
+  by `HMAC-SHA256(salt, "kind:id")` and names are left out. The same salt gives the same ids on the
+  next export; without it nobody can map them back. Keep the salt outside the repo and the exports.
+- Free-text fields (task titles, timesheet descriptions) are never read.
+- Other options: `--project ID` (repeatable), `--out` (default `data/odoo`).
 
 ### The CSV files
 
@@ -186,6 +210,7 @@ Known limits, all visible above:
 
 | file | purpose |
 |---|---|
+| `odoo_extract.py` | export from Odoo 17+ over XML-RPC |
 | `analyze.py` | loading, analysis, terminal summary, CSV and SPMF output |
 | `report.py` | the HTML report |
 | `generate_sample.py` | synthetic dataset with planted effects |
